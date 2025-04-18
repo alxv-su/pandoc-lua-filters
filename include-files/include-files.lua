@@ -8,7 +8,11 @@ PANDOC_VERSION:must_be_at_least '2.12'
 
 local List = require 'pandoc.List'
 local path = require 'pandoc.path'
-local system = require 'pandoc.system'
+
+if #PANDOC_STATE.input_files > 1 then
+	io.stderr:write("Error: only a single input file is supported.\n")
+	os.exit(1)
+end
 
 local warn = pcall(require, 'pandoc.log')
   and (require 'pandoc.log').warn
@@ -51,7 +55,7 @@ local function update_contents(blocks, shift_by, include_path)
       if cb.attributes.include and path.is_relative(cb.attributes.include) then
         cb.attributes.include =
           path.normalize(path.join({include_path, cb.attributes.include}))
-        end
+      end
       return cb
     end
   }
@@ -61,7 +65,7 @@ end
 
 --- Filter function for code blocks
 local transclude
-function transclude (cb)
+function transclude (cb, parent_file)
   -- ignore code blocks which are not of class "include".
   if not cb.classes:includes 'include' then
     return
@@ -88,9 +92,14 @@ function transclude (cb)
   local blocks = List:new()
   for line in cb.text:gmatch('[^\n]+') do
     if line:sub(1,2) ~= '//' then
-      local fh = io.open(line)
+      -- resolve path relative to parent file
+      local resolved_path = path.is_absolute(line) and 
+                          line or 
+                          path.normalize(path.join({parent_file and path.directory(parent_file) or ".", line}))
+
+      local fh = io.open(resolved_path)
       if not fh then
-        warn("Cannot open file " .. line .. " | Skipping includes")
+        warn("Cannot open file " .. resolved_path .. " | Skipping includes")
       else
         -- read file as the given format with global reader options
         local contents = pandoc.read(
@@ -99,19 +108,21 @@ function transclude (cb)
           PANDOC_READER_OPTIONS
         ).blocks
         last_heading_level = 0
-        -- recursive transclusion
-        contents = system.with_working_directory(
-            path.directory(line),
-            function ()
-              return pandoc.walk_block(
-                pandoc.Div(contents),
-                { Header = update_last_level, CodeBlock = transclude }
-              )
-            end).content
+        
+        -- recursive transclusion with current file as parent
+        contents = pandoc.walk_block(
+          pandoc.Div(contents),
+          { 
+            Header = update_last_level, 
+            CodeBlock = function(cb) 
+              return transclude(cb, resolved_path) 
+            end 
+          }
+        ).content
         --- reset to level before recursion
         last_heading_level = buffer_last_heading_level
         blocks:extend(update_contents(contents, shift_heading_level_by,
-                                      path.directory(line)))
+                                    path.directory(resolved_path)))
         fh:close()
       end
     end
@@ -119,7 +130,13 @@ function transclude (cb)
   return blocks
 end
 
+-- Wrapper for top-level transclusion
+local function transclude_top(cb)
+  local parent_file = PANDOC_STATE.input_files[1]
+  return transclude(cb, parent_file or ".")
+end
+
 return {
   { Meta = get_vars },
-  { Header = update_last_level, CodeBlock = transclude }
+  { Header = update_last_level, CodeBlock = transclude_top }
 }
